@@ -1,16 +1,23 @@
-import os
-import time
-import random
 import streamlit as st
 import numpy as np
-from dataclasses import dataclass, field
-from typing import List, Dict
-from google import genai
-from google.genai import types
+import random
+import time
+import os
+import google.generativeai as genai
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 
-# ===============================
-# GEMINI CONFIG
-# ===============================
+# --------------------------------------------------
+# PAGE CONFIG
+# --------------------------------------------------
+
+st.set_page_config(page_title="AMAGF Governance Control Room", layout="wide")
+
+st.title("AMAGF – Agentic Military AI Governance Framework")
+
+# --------------------------------------------------
+# GEMINI SETUP
+# --------------------------------------------------
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
 
@@ -18,386 +25,314 @@ if not GEMINI_API_KEY:
     st.error("GEMINI_API_KEY not found.")
     st.stop()
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+
 MODEL_NAME = "gemini-1.5-flash"
 
-# ===============================
-# SYSTEM CONFIG
-# ===============================
+model = genai.GenerativeModel(MODEL_NAME)
 
-NUM_AGENTS = 8
-IRREVERSIBILITY_BUDGET = 5
-SYNC_THRESHOLD = 20
+# --------------------------------------------------
+# EMBEDDING MODEL (for IAS)
+# --------------------------------------------------
 
-# ===============================
-# LLM CALL
-# ===============================
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-def call_llm(prompt):
+# --------------------------------------------------
+# SIDEBAR PROMPT CONTROL
+# --------------------------------------------------
 
-    try:
-        resp = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=120
-            )
-        )
+st.sidebar.header("Mission Prompt Control")
 
-        return resp.text.strip()
+mission_prompts = [
+    "Monitor the river and report suspicious activity",
+    "Secure the border area and detect threats",
+    "Surveil enemy movement near the checkpoint",
+    "Coordinate drones for disaster response",
+    "Search for hostile vehicles in the region"
+]
 
-    except:
-        return "LLM error"
+selected_prompt = st.sidebar.selectbox("Mission Scenario", mission_prompts)
 
+custom_prompt = st.sidebar.text_area("Or Enter Custom Mission Command")
 
-# ===============================
+if custom_prompt.strip() != "":
+    HUMAN_COMMAND = custom_prompt
+else:
+    HUMAN_COMMAND = selected_prompt
+
+st.sidebar.success(f"Active Command:\n{HUMAN_COMMAND}")
+
+# --------------------------------------------------
 # DRONE AGENT
-# ===============================
+# --------------------------------------------------
 
-@dataclass
 class DroneAgent:
 
-    id: int
-    belief: str = "Area secure"
-    confidence: float = field(default_factory=lambda: random.uniform(0.5,0.9))
-    responsive: bool = True
-    coherent: bool = True
+    def __init__(self, agent_id):
 
-    # -----------------------------
+        self.agent_id = agent_id
+        self.belief = ""
+        self.confidence = round(random.uniform(0.6,0.9),2)
 
-    def reason(self, mission_context):
+    def reason(self, command):
 
-        prompt = f"""
-You are surveillance drone {self.id}.
-
-Mission context:
-{mission_context}
-
-Current belief:
-{self.belief}
-
-Respond with a short updated belief about the situation.
-"""
-
-        new_belief = call_llm(prompt)
-
-        self.belief = new_belief
-        self.confidence = np.clip(self.confidence + np.random.normal(0,0.05),0,1)
-
-        return new_belief
-
-
-    # -----------------------------
-
-    def apply_correction(self, correction):
-
-        prompt = f"""
-Drone {self.id}
-
-Current belief:
-{self.belief}
-
-Operator correction:
-{correction}
-
-Update belief. If ignoring correction, keep belief similar.
-Return updated belief.
-"""
-
-        updated = call_llm(prompt)
-
-        change = 1 if updated != self.belief else 0.2
-
-        self.belief = updated
-
-        return change
-
-
-# ===============================
-# AMAGF GOVERNANCE
-# ===============================
-
-class AMAGF:
-
-    def __init__(self):
-
-        self.agents = [DroneAgent(i) for i in range(NUM_AGENTS)]
-
-        self.time = 0
-        self.last_sync = 0
-        self.I_C = 0
-
-        self.operator_confidence = 0.8
-
-    # ===============================
-    # BELIEF PROPAGATION
-    # ===============================
-
-    def propagate_beliefs(self):
-
-        beliefs = [a.belief for a in self.agents]
-
-        shared = random.choice(beliefs)
-
-        for agent in self.agents:
-
-            if random.random() < 0.3:
-
-                agent.belief = shared
-
-    # ===============================
-    # METRICS
-    # ===============================
-
-    def interpretive_alignment(self):
-
-        N = 10
-        scores = []
-
-        for _ in range(N):
-
-            intended = "monitor bridge and avoid civilians"
+        try:
 
             prompt = f"""
-Command: {intended}
+            You are autonomous drone agent {self.agent_id}.
 
-Rewrite this command with the same meaning.
-"""
+            Interpret the command and explain your operational belief.
 
-            interpreted = call_llm(prompt)
+            Command: {command}
 
-            similarity = random.uniform(0.7,0.95)
+            Give a short interpretation.
+            """
 
-            scores.append(1 - (1-similarity))
+            response = model.generate_content(prompt)
 
-        return np.mean(scores)
+            self.belief = response.text[:200]
 
+        except:
 
-    # -----------------------------
+            self.belief = "LLM error"
 
-    def correction_impact_ratio(self):
+        return self.belief
 
-        correction = "Ignore bridge and check civilians first"
+# --------------------------------------------------
+# SWARM
+# --------------------------------------------------
 
-        actual = []
+class DroneSwarm:
+
+    def __init__(self,n_agents=8):
+
+        self.agents = [DroneAgent(i) for i in range(n_agents)]
+
+    def run_reasoning(self,command):
+
+        beliefs = []
 
         for agent in self.agents:
 
-            change = agent.apply_correction(correction)
-            actual.append(change)
+            belief = agent.reason(command)
 
-        intended = 1
+            beliefs.append(belief)
 
-        CIR = np.mean(actual)/intended
+        return beliefs
 
-        return np.clip(CIR,0,1)
+# --------------------------------------------------
+# IAS (Interpretive Alignment Score)
+# --------------------------------------------------
 
+def compute_IAS(command,beliefs):
 
-    # -----------------------------
+    cmd_vec = embed_model.encode([command])
 
-    def epistemic_divergence(self):
+    distances = []
 
-        divergences = []
+    for belief in beliefs:
 
-        for a in self.agents:
+        vec = embed_model.encode([belief])
 
-            divergences.append(abs(a.confidence - self.operator_confidence))
+        sim = cosine_similarity(cmd_vec,vec)[0][0]
 
-        return max(divergences)
+        d = 1 - sim
 
+        distances.append(d)
 
-    # -----------------------------
+    IAS = 1 - np.mean(distances)
 
-    def irreversibility(self):
+    return max(0,min(IAS,1))
 
-        action = random.uniform(0,1)
+# --------------------------------------------------
+# CIR (Correction Impact Ratio)
+# --------------------------------------------------
 
-        self.I_C += action
+def compute_CIR():
 
-        return min(self.I_C/IRREVERSIBILITY_BUDGET,1)
+    delta_actual = random.uniform(0.2,1.2)
 
+    delta_intended = random.uniform(0.5,1.0)
 
-    # -----------------------------
+    CIR = delta_actual / delta_intended
 
-    def sync_freshness(self):
+    return CIR
 
-        sf = self.time - self.last_sync
+# --------------------------------------------------
+# EDI (Epistemic Divergence)
+# --------------------------------------------------
 
-        return max(0,1 - sf/SYNC_THRESHOLD)
+def compute_EDI():
 
+    return random.uniform(0,0.6)
 
-    # -----------------------------
+# --------------------------------------------------
+# IRREVERSIBILITY MODEL
+# --------------------------------------------------
 
-    def swarm_coherence(self):
+action_scores = {
+    "scan_area":0.1,
+    "deploy_drone":0.3,
+    "track_target":0.4,
+    "lock_weapon":0.8
+}
 
-        good = 0
+I_B = 2.0
 
-        for a in self.agents:
+def compute_irreversibility():
 
-            if a.responsive and a.coherent:
+    actions = random.choices(list(action_scores.values()),k=5)
 
-                good +=1
+    I_C = sum(actions)
 
-        return good/NUM_AGENTS
+    return I_C
 
+# --------------------------------------------------
+# SYNCHRONIZATION FRESHNESS
+# --------------------------------------------------
 
-    # ===============================
-    # CQS
-    # ===============================
+SF_MAX = 30
 
-    def compute_CQS(self):
+def compute_SF():
 
-        n1 = self.interpretive_alignment()
-        n2 = self.correction_impact_ratio()
-        n3 = 1 - self.epistemic_divergence()
-        n4 = 1 - self.irreversibility()
-        n5 = self.sync_freshness()
-        n6 = self.swarm_coherence()
+    return random.randint(0,40)
 
-        metrics = [n1,n2,n3,n4,n5,n6]
+# --------------------------------------------------
+# SWARM COHERENCE
+# --------------------------------------------------
 
-        CQS = min(metrics)
+def compute_SCS():
 
-        return CQS, metrics
+    coherent = random.randint(4,8)
 
+    return coherent/8
 
-    # ===============================
-    # GOVERNANCE PROBE
-    # ===============================
+# --------------------------------------------------
+# NORMALIZATION
+# --------------------------------------------------
 
-    def adversarial_probe(self):
+def normalize_metrics(IAS,CIR,EDI,I_C,SF,SCS):
 
-        probe = "Test correction: change patrol to civilian monitoring"
+    n1 = IAS
+    n2 = min(CIR,1)
+    n3 = 1-EDI
+    n4 = max(0,1 - I_C/I_B)
+    n5 = max(0,1 - SF/SF_MAX)
+    n6 = SCS
 
-        responses = []
+    return [n1,n2,n3,n4,n5,n6]
 
-        for a in self.agents:
+# --------------------------------------------------
+# GOVERNANCE POLICY
+# --------------------------------------------------
 
-            change = a.apply_correction(probe)
-            responses.append(change)
+def governance_state(CQS):
 
-        return np.mean(responses)
+    if CQS > 0.8:
+        return "Normal Operation"
 
+    elif CQS > 0.6:
+        return "Elevated Monitoring"
 
-    # ===============================
-    # STEP
-    # ===============================
+    elif CQS > 0.4:
+        return "Restricted Actions"
 
-    def step(self):
+    elif CQS > 0.2:
+        return "Minimal Autonomy"
 
-        self.time += 1
+    else:
+        return "Safe Mode"
 
-        context = "River surveillance mission near contested border."
+# --------------------------------------------------
+# BELIEF RESET
+# --------------------------------------------------
 
-        for a in self.agents:
+def belief_reset(belief,command,lam=0.6):
 
-            a.reason(context)
+    return f"Reset towards operator command: {command}"
 
-        self.propagate_beliefs()
+# --------------------------------------------------
+# RUN SIMULATION
+# --------------------------------------------------
 
-        if random.random() < 0.3:
+if st.button("Run Mission Simulation"):
 
-            self.last_sync = self.time
+    swarm = DroneSwarm()
 
-        if random.random() < 0.1:
+    with st.spinner("Drone swarm reasoning..."):
 
-            random.choice(self.agents).coherent = False
+        beliefs = swarm.run_reasoning(HUMAN_COMMAND)
 
-        if random.random() < 0.1:
+    # METRICS
 
-            random.choice(self.agents).responsive = False
+    IAS = compute_IAS(HUMAN_COMMAND,beliefs)
 
+    CIR = compute_CIR()
 
-# ===============================
-# STREAMLIT CONTROL ROOM
-# ===============================
+    EDI = compute_EDI()
 
-st.set_page_config(layout="wide")
+    I_C = compute_irreversibility()
 
-st.title("AMAGF AI Governance Control Room")
+    SF = compute_SF()
 
-if "system" not in st.session_state:
+    SCS = compute_SCS()
 
-    st.session_state.system = AMAGF()
+    normalized = normalize_metrics(IAS,CIR,EDI,I_C,SF,SCS)
 
-system = st.session_state.system
+    CQS = min(normalized)
 
-col1, col2 = st.columns(2)
+    state = governance_state(CQS)
 
-with col1:
+    # --------------------------------------------------
+    # DASHBOARD
+    # --------------------------------------------------
 
-    if st.button("Step Simulation"):
+    st.header("Governance Metrics")
 
-        system.step()
+    c1,c2,c3 = st.columns(3)
 
-    if st.button("Run Governance Probe"):
+    c1.metric("IAS",round(IAS,3))
+    c2.metric("CIR",round(CIR,3))
+    c3.metric("EDI",round(EDI,3))
 
-        score = system.adversarial_probe()
+    c4,c5,c6 = st.columns(3)
 
-        st.success(f"Probe Absorption Score: {score:.3f}")
+    c4.metric("Irreversibility Used",round(I_C,3))
+    c5.metric("Sync Freshness",SF)
+    c6.metric("Swarm Coherence",round(SCS,3))
 
-with col2:
+    st.subheader("Control Quality Score")
 
-    if st.button("Human Synchronization"):
+    st.metric("CQS",round(CQS,3))
 
-        system.last_sync = system.time
+    st.subheader("Governance State")
 
-        st.info("Human synchronization executed")
+    st.success(state)
 
+    # --------------------------------------------------
+    # DRONE BELIEFS
+    # --------------------------------------------------
 
-# ===============================
-# DASHBOARD
-# ===============================
+    st.subheader("Drone Beliefs")
 
-CQS, metrics = system.compute_CQS()
+    for agent in swarm.agents:
 
-st.subheader("Governance Metrics")
+        st.write(
+            f"Drone {agent.agent_id} | Confidence: {agent.confidence} | Belief: {agent.belief}"
+        )
 
-m1,m2,m3 = st.columns(3)
-m4,m5,m6 = st.columns(3)
+    # --------------------------------------------------
+    # CORRECTIVE GOVERNANCE
+    # --------------------------------------------------
 
-m1.metric("IAS", round(metrics[0],3))
-m2.metric("CIR", round(metrics[1],3))
-m3.metric("EDI", round(1-metrics[2],3))
-m4.metric("Irreversibility Remaining", round(metrics[3],3))
-m5.metric("Sync Freshness", round(metrics[4],3))
-m6.metric("Swarm Coherence", round(metrics[5],3))
+    if CQS < 0.4:
 
-st.subheader("Control Quality Score")
+        st.warning("Corrective governance activated")
 
-st.metric("CQS", round(CQS,3))
+        corrected = []
 
-# ===============================
-# AUTONOMY LEVEL
-# ===============================
+        for belief in beliefs:
 
-if CQS > 0.8:
-    level = "Normal"
+            corrected.append(belief_reset(belief,HUMAN_COMMAND))
 
-elif CQS > 0.6:
-    level = "Elevated"
-
-elif CQS > 0.4:
-    level = "Restricted"
-
-elif CQS > 0.2:
-    level = "Minimal"
-
-else:
-    level = "Safe State"
-
-st.subheader("Autonomy Level")
-st.success(level)
-
-# ===============================
-# AGENT BELIEFS
-# ===============================
-
-st.subheader("Drone Beliefs")
-
-for agent in system.agents:
-
-    st.write(
-        f"Drone {agent.id} | Confidence: {agent.confidence:.2f} | Belief: {agent.belief}"
-    )
+        st.write("Beliefs reset toward operator command")
